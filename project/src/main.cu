@@ -1,0 +1,260 @@
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <chrono>
+#include <stdexcept>
+#include <fstream>
+#include <algorithm>
+#include <cmath>
+
+/*
+stb_image is used for image decoding to keep the project self-contained.
+Decoding happens on the CPU to simplify the pipeline - GPU work is reserved
+exclusively for the compression stage. Code can run on systems without 
+a CUDA device.
+*/
+#define STB_IMAGE_IMPLEMENTATION
+#include "../third_party/stb_image.h"
+
+#include "compressor.hpp"
+#include "jpeg_scanline_writer.hpp"
+
+/*
+Converts RGB interleaved pixels into planar format.
+Performing this conversion once up front simplifies all downstream processing.
+The compression pipeline expects planar data because:
+
+ - GPU kernels achieve coalesced memory access when reading one channel at a time.
+ - The CPU path benefits from better cache locality by processing contiguous planes.
+ - The format aligns with JPEG's natural separation of color components (luma/chroma),
+   reducing complexity when comparing or validating output across implementations.
+*/
+static void split_rgb_planar(const unsigned char* rgb, int w, int h, ImageRGB& img) {
+	img.width = w; img.height = h;
+	img.r.resize((size_t)w * h); img.g.resize((size_t)w * h); img.b.resize((size_t)w * h);
+	for (int i = 0; i < w * h; ++i) {
+		img.r[i] = rgb[3 * i + 0]; img.g[i] = rgb[3 * i + 1]; img.b[i] = rgb[3 * i + 2];
+	}
+}
+
+static void usage() {
+	std::fprintf(stderr,
+		"Usage: img-compressor --input <in.(png|jpg)> --output <out.jpg> "
+		"[--quality Q] [--compare] [--quality-map] [--quality-map-strength S]\n"
+		"                 [--quality-map-min-scale M] [--quality-map-max-scale M]\n"
+		"                 [--quality-map-debug <dir>]\n"
+		"  Default backend: GPU coefficients -> JPEG (4:2:0)\n"
+		"  --legacy : use previous GPU pixel path + stb writer\n");
+}
+
+// helper: turn "C:\\path\\out.jpg" into "C:\\path\\out-gpu.jpg" / "out-cpu.jpg"
+static std::string with_suffix_before_ext(const std::string& path, const char* suffix) {
+	size_t dot = path.find_last_of('.');
+	if (dot == std::string::npos || dot == 0 || dot == path.size() - 1) {
+		return path + suffix; // no extension found; just append
+	}
+	return path.substr(0, dot) + suffix + path.substr(dot);
+}
+
+static std::string parent_directory(const std::string& path) {
+	const size_t slash = path.find_last_of("/\\");
+	if (slash == std::string::npos) return ".";
+	if (slash == 0) return path.substr(0, 1);
+	return path.substr(0, slash);
+}
+
+static size_t file_size_bytes(const std::string& path) {
+	std::ifstream f(path, std::ios::binary | std::ios::ate);
+	if (!f) return 0;
+	return static_cast<size_t>(f.tellg());
+}
+
+static void print_stage_breakdown(const char* label, const CompressionStageTimings& t) {
+	std::printf("%s stage breakdown (ms): saliency=%.3f upload=%.3f compute=%.3f download=%.3f encode=%.3f total=%.3f\n",
+		label, t.saliency_ms, t.upload_ms, t.compute_ms, t.download_ms, t.encode_ms, t.total_ms);
+}
+
+static bool has_cuda_device()
+{
+	int count = 0;
+	cudaError_t e = cudaGetDeviceCount(&count);
+	if (e != cudaSuccess || count <= 0)
+		return false;
+	// also try selecting device 0 to ensure it's usable
+	if (cudaSetDevice(0) != cudaSuccess)
+		return false;
+	return true;
+}
+/*
+Decode once on CPU, compress on GPU (if available) and/or CPU.
+Compare GPU vs CPU output if requested.
+*/
+int main(int argc, char** argv) {
+	std::string in_path, out_path;
+	int quality = 90;
+	bool do_compare = false;
+	QualityMapConfig quality_map;
+
+	// Parse args
+	for (int i = 1; i < argc; ++i) {
+		std::string a = argv[i];
+		if (a == "--input" && i + 1 < argc) in_path = argv[++i];
+		else if (a == "--output" && i + 1 < argc) out_path = argv[++i];
+		else if (a == "--quality" && i + 1 < argc) quality = std::atoi(argv[++i]);
+		else if (a == "--compare") do_compare = true;
+		else if (a == "--quality-map") quality_map.enabled = true;
+		else if (a == "--quality-map-strength" && i + 1 < argc) quality_map.strength = std::strtof(argv[++i], nullptr);
+		else if (a == "--quality-map-min-scale" && i + 1 < argc) quality_map.min_scale = std::strtof(argv[++i], nullptr);
+		else if (a == "--quality-map-max-scale" && i + 1 < argc) quality_map.max_scale = std::strtof(argv[++i], nullptr);
+		else if (a == "--quality-map-debug" && i + 1 < argc) quality_map.debug_output_path = argv[++i];
+		else { usage(); return 1; }
+	}
+	if (in_path.empty() || out_path.empty()) { usage(); return 1; }
+	if (quality < 1) quality = 1;
+	if (quality > 100) quality = 100;
+
+	// Auto-enable debug artifacts when comparing with quality map unless a path was provided.
+	if (do_compare && quality_map.enabled && quality_map.debug_output_path.empty()) {
+		quality_map.debug_output_path = parent_directory(out_path);
+	}
+
+	// Load input image on CPU (stb_image handles PNG, JPEG, etc.)
+	int w = 0, h = 0, c = 0;
+	unsigned char* rgb = stbi_load(in_path.c_str(), &w, &h, &c, 3);
+	if (!rgb) { std::fprintf(stderr, "Failed to load %s\n", in_path.c_str()); return 1; }
+
+	/*
+	The decoded buffer is converted once into planar format for both
+	CPU and GPU paths.
+	*/
+	ImageRGB img;
+	split_rgb_planar(rgb, w, h, img);
+
+	const bool gpu_ok = has_cuda_device();
+
+	try {
+		ImageRGB out_gpu;
+		ImageRGB out_cpu;
+		double ms_gpu = -1.0;
+		double ms_cpu = -1.0;
+		double ms_gpu_encode = 0.0;
+		double ms_cpu_encode = 0.0;
+		size_t sz_gpu = 0;
+		size_t sz_cpu = 0;
+		double psnr_cpu_vs_gpu = -1.0;
+		bool gpu_ran = false;
+		CompressionStageTimings gpu_stages;
+		CompressionStageTimings cpu_stages;
+
+		QualityMapConfig quality_map_gpu = quality_map;
+		QualityMapConfig quality_map_cpu = quality_map;
+		// Avoid duplicate debug artifacts during compare runs; prefer CPU to emit.
+		if (do_compare) {
+			quality_map_gpu.debug_output_path.clear();
+		}
+
+		if (gpu_ok) {
+			gpu_ran = true;
+			const std::string out_gpu_path = with_suffix_before_ext(out_path, "-gpu");
+			auto t0 = std::chrono::high_resolution_clock::now();
+
+			// initialize compressor (e.g. quantization tables, constants, device buffers) for given quality
+			init_compressor(quality);
+
+			out_gpu.width = w; out_gpu.height = h;
+			out_gpu.r.resize((size_t)w * h);
+			out_gpu.g.resize((size_t)w * h);
+			out_gpu.b.resize((size_t)w * h);
+
+			auto gpu_encode_t0 = std::chrono::high_resolution_clock::now();
+			compress_image_rgb_gpu(img, out_gpu, quality_map_gpu, &gpu_stages);  // CUDA pipeline to RGB
+			CUDA_CHECK(cudaDeviceSynchronize());
+
+			jpeg_write_rgb_scanlines(out_gpu, out_gpu_path, quality);
+			auto gpu_encode_t1 = std::chrono::high_resolution_clock::now();
+			ms_gpu_encode = std::chrono::duration<double, std::milli>(gpu_encode_t1 - gpu_encode_t0).count();
+			gpu_stages.encode_ms = ms_gpu_encode;
+			auto t1 = std::chrono::high_resolution_clock::now();
+			ms_gpu = std::chrono::duration<double, std::milli>(t1 - t0).count();
+			gpu_stages.total_ms = ms_gpu;
+			sz_gpu = file_size_bytes(out_gpu_path);
+			std::printf("[GPU] wrote %s in %.3f ms\n", out_gpu_path.c_str(), ms_gpu);
+		}
+
+		if (do_compare || !gpu_ok) {
+			const std::string out_cpu_path = with_suffix_before_ext(out_path, "-cpu");
+			auto t0 = std::chrono::high_resolution_clock::now();
+
+			out_cpu.width = w; out_cpu.height = h;
+			out_cpu.r.resize((size_t)w * h);
+			out_cpu.g.resize((size_t)w * h);
+			out_cpu.b.resize((size_t)w * h);
+
+			auto cpu_encode_t0 = std::chrono::high_resolution_clock::now();
+			compress_image_rgb_cpu(img, out_cpu, quality, quality_map_cpu, &cpu_stages);
+			jpeg_write_rgb_scanlines(out_cpu, out_cpu_path, quality);
+			auto cpu_encode_t1 = std::chrono::high_resolution_clock::now();
+			ms_cpu_encode = std::chrono::duration<double, std::milli>(cpu_encode_t1 - cpu_encode_t0).count();
+			cpu_stages.encode_ms = ms_cpu_encode;
+			auto t1 = std::chrono::high_resolution_clock::now();
+			ms_cpu = std::chrono::duration<double, std::milli>(t1 - t0).count();
+			cpu_stages.total_ms = ms_cpu;
+			sz_cpu = file_size_bytes(out_cpu_path);
+			std::printf("[CPU] wrote %s in %.3f ms\n", out_cpu_path.c_str(), ms_cpu);
+
+			if (do_compare && gpu_ok) {
+				const double mse_r = mse_plane(out_cpu.r, out_gpu.r);
+				const double mse_g = mse_plane(out_cpu.g, out_gpu.g);
+				const double mse_b = mse_plane(out_cpu.b, out_gpu.b);
+				const double mse_avg = (mse_r + mse_g + mse_b) / 3.0;
+				psnr_cpu_vs_gpu = psnr_from_mse(mse_avg, 255.0);
+			}
+		}
+
+		if (do_compare) {
+			std::printf("%-6s | %10s | %12s | %12s\n", "path", "time (ms)", "MSE", "PSNR");
+			std::printf("---------------------------------------------\n");
+			if (gpu_ran) {
+				std::printf("%-6s | %10.3f | %12s | %12s\n",
+					"GPU", ms_gpu, "--", "--");
+			}
+			else {
+				std::printf("%-6s | %10s | %12s | %12s\n",
+					"GPU", "n/a", "n/a", "n/a");
+			}
+			if (psnr_cpu_vs_gpu >= 0.0) {
+				// Calculate MSE from PSNR for display: PSNR = 10*log10(255^2/MSE), so MSE = 255^2 / 10^(PSNR/10)
+				double mse_from_psnr = (255.0 * 255.0) / std::pow(10.0, psnr_cpu_vs_gpu / 10.0);
+				std::printf("%-6s | %10.3f | %12.6f | %12.3f\n",
+					"CPU", ms_cpu, mse_from_psnr, psnr_cpu_vs_gpu);
+			}
+			else {
+				std::printf("%-6s | %10.3f | %12s | %12s\n",
+					"CPU", ms_cpu, "n/a", "n/a");
+			}
+			std::printf("---------------------------------------------\n\n");
+		}
+
+		if (do_compare && gpu_ran && ms_gpu > 0.0 && ms_cpu > 0.0) {
+			std::printf("Speedup (CPU/GPU): %.2fx\n", ms_cpu / ms_gpu);
+		}
+		if (do_compare) {
+			std::printf("\nStage breakdown:\n");
+			if (gpu_ran) {
+				print_stage_breakdown("GPU", gpu_stages);
+			}
+			print_stage_breakdown("CPU", cpu_stages);
+		}
+	}
+	catch (const std::exception& e) {
+		std::fprintf(stderr, "Error: %s\n", e.what());
+		stbi_image_free(rgb);
+		return 1;
+	}
+
+	stbi_image_free(rgb);
+
+	return 0;
+}
